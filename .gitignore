@@ -1,0 +1,15 @@
+### python ###
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+build/
+
+### vscode ###
+.vscode/
+
+### log and temp ###
+*.log
+*.swp
+.DS_Store
