@@ -1,0 +1,2 @@
+bluezero>=0.9.1
+pyserial>=3.5
