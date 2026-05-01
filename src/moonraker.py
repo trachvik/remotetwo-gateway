@@ -43,6 +43,11 @@ class MoonrakerClient:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._running = False
+        self._temp_cache: dict[str, float] = {}  # last known temperatures
+        self._fan_pct: float | None = None         # last known fan speed (0-100 %)
+        self._printing: bool = False               # currently printing
+        self._can_move: bool = True                # last computed can_move; default True so firmware is not blocked before first update
+        self._homed: str | None = None             # last known homed_axes string
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,6 +109,17 @@ class MoonrakerClient:
         }))
         logger.debug("Subscribed to printer objects (id=%d)", req_id)
 
+        # Explicit initial query — ensures we have the current state even if
+        # the subscription response omits unchanged fields.
+        req_id = self._alloc_id()
+        await self._ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "method":  "printer.objects.query",
+            "params":  {"objects": _SUBSCRIBED_OBJECTS},
+            "id":      req_id,
+        }))
+        logger.debug("Initial state query (id=%d)", req_id)
+
     async def _send_gcode_coro(self, script: str) -> bool:
         if self._ws is None:
             return False
@@ -140,6 +156,10 @@ class MoonrakerClient:
                     fut.set_result(False)
                 else:
                     fut.set_result(True)
+            # Process initial full state from subscription response
+            result = data.get("result", {})
+            if isinstance(result, dict) and "status" in result:
+                self._process_status(result["status"])
             return
 
         # Push notification from the subscription
@@ -152,18 +172,33 @@ class MoonrakerClient:
         # Convert Moonraker status dict to firmware state:… protocol strings.
         msgs: list[str] = []
 
-        # Temperatures
-        extruder   = status.get("extruder",   {})
-        heater_bed = status.get("heater_bed", {})
-        temp_parts: list[str] = []
-        te = extruder.get("temperature")
-        tb = heater_bed.get("temperature")
+        # Temperatures — merge into cache so partial updates don't lose previous values
+        te = status.get("extruder",   {}).get("temperature")
+        tb = status.get("heater_bed", {}).get("temperature")
         if te is not None:
-            temp_parts.append(f"e:{te:.1f}")
+            self._temp_cache["e"] = te
+            logger.info("temp extruder=%.1f", te)
         if tb is not None:
-            temp_parts.append(f"b:{tb:.1f}")
-        if temp_parts:
-            msgs.append("state:temp:" + ":".join(temp_parts))
+            self._temp_cache["b"] = tb
+            logger.info("temp bed=%.1f", tb)
+        else:
+            logger.debug("heater_bed not in this update (cache b=%.1f)",
+                         self._temp_cache.get("b", 0.0))
+        # Send extruder and bed as SEPARATE messages to stay within 20-byte BLE MTU.
+        # A combined message like 'state:temp:e:100.0:b:100.0' is 28 bytes and would
+        # be split across two ATT packets, causing the second value to be lost.
+        if "e" in self._temp_cache:
+            msgs.append(f"state:temp:e:{self._temp_cache['e']:.1f}")
+        if "b" in self._temp_cache:
+            msgs.append(f"state:temp:b:{self._temp_cache['b']:.1f}")
+
+        # Fan speed (Moonraker: 0.0–1.0 → firmware: 0–100 %)
+        fan = status.get("fan", {})
+        if "speed" in fan:
+            self._fan_pct = fan["speed"] * 100.0
+            logger.info("fan speed=%.1f%%", self._fan_pct)
+        if self._fan_pct is not None:
+            msgs.append(f"state:fan:{self._fan_pct:.1f}")
 
         # Toolhead position and homed axes
         toolhead = status.get("toolhead", {})
@@ -175,7 +210,10 @@ class MoonrakerClient:
                     f":z:{pos[2]:.2f}:e:{pos[3]:.2f}"
                 )
         if "homed_axes" in toolhead:
-            homed = toolhead["homed_axes"]  # string like "xyz"
+            self._homed = toolhead["homed_axes"]
+            logger.debug("homed_axes=%r", self._homed)
+        if self._homed is not None:
+            homed = self._homed
             msgs.append(
                 f"state:homed"
                 f":x:{'1' if 'x' in homed else '0'}"
@@ -183,14 +221,23 @@ class MoonrakerClient:
                 f":z:{'1' if 'z' in homed else '0'}"
             )
 
-        # Print state and can_move
+        # Print state
         print_stats = status.get("print_stats", {})
         if "state" in print_stats:
             pstate = print_stats["state"]
-            printing = pstate == "printing"
-            can_move = pstate in ("standby", "complete", "error", "cancelled")
-            msgs.append(f"state:printing:{'1' if printing else '0'}")
-            msgs.append(f"state:can_move:{'1' if can_move else '0'}")
+            self._printing = (pstate == "printing")
+            logger.info("print_stats.state=%r → printing=%s", pstate, self._printing)
+            msgs.append(f"state:printing:{'1' if self._printing else '0'}")
+
+        # can_move: allow movement whenever not actively printing.
+        # Klipper itself enforces homing requirements and will error if axes
+        # are not homed — no need to duplicate that logic here.
+        new_can_move = not self._printing
+        if new_can_move != self._can_move:
+            logger.info("can_move changed: %s → %s (printing=%s)",
+                        self._can_move, new_can_move, self._printing)
+            self._can_move = new_can_move
+        msgs.append(f"state:can_move:{'1' if self._can_move else '0'}")
 
         if msgs and self._on_state:
             self._on_state(msgs)

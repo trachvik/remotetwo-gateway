@@ -28,6 +28,35 @@ class ProtocolTranslator:
 	# Python format strings; {sheet} and {value} are substituted at translation time.
 	sheet_template: str = "SET_PRINT_SHEET NAME={sheet}"
 	z_offset_template: str = "SET_GCODE_OFFSET Z_ADJUST={value:.2f} MOVE=1"
+	# Control
+	home_all_gcode: str = "G28"
+	home_x_gcode: str = "G28 X"
+	home_y_gcode: str = "G28 Y"
+	home_z_gcode: str = "G28 Z"
+	motors_off_gcode: str = "M84"
+	fan_template: str = "M106 S{value}"   # {value} = 0-255 (scaled from 0-100%)
+	# Temperature
+	cool_down_gcode: str = "TURN_OFF_HEATERS"
+	# Filament
+	preheat_pla_gcode: str = "PREHEAT_PLA"
+	preheat_petg_gcode: str = "PREHEAT_PETG"
+	load_filament_gcode: str = "LOAD_FILAMENT"
+	unload_filament_gcode: str = "UNLOAD_FILAMENT"
+	# Calibration
+	calib_z_gcode: str = "CALIBRATE_Z"
+	calib_bed_mesh_gcode: str = "M80"
+	calib_first_layer_gcode: str = "FIRST_LAYER_CALIBRATION"
+	calib_probe_gcode: str = "PROBE_CALIBRATE"
+	# MMU
+	mmu_home_gcode: str = "HOME_TRADRACK"
+	mmu_resume_gcode: str = "MMU_RESUME"
+	mmu_locate_template: str = "LOCATE_SELECTOR lane={tool}"
+	# Printing
+	print_pause_gcode: str = "PAUSE"
+	flow_template: str = "M221 S{value}"   # {value} = percent
+	speed_template: str = "M220 S{value}"  # {value} = percent
+	# Fake position
+	fake_position_gcode: str = "SET_KINEMATIC_POSITION X=150 Y=150 Z=10"
 
 	def translate(self, raw_line: str) -> list[str]:
 		# Parse one NUS line and return the G-code lines to send to Moonraker.
@@ -81,6 +110,55 @@ class ProtocolTranslator:
 			return self._translate_offset(parts[1])
 		if command == "s" and len(parts) == 2:
 			return self._translate_sheet(parts[1])
+		# Control
+		if command == "home":
+			if len(parts) == 2:
+				return self._translate_home(parts[1])
+			if len(parts) == 1 or (len(parts) == 2 and parts[1] == "all"):
+				return [self.home_all_gcode]
+		if payload == "motors:off":
+			return [self.motors_off_gcode]
+		if command == "fan" and len(parts) == 2:
+			pct = float(parts[1])
+			return [self.fan_template.format(value=round(pct * 2.55))]
+		# Temperature extras
+		if payload == "cool:down":
+			return [self.cool_down_gcode]
+		# Filament
+		if payload == "filament:preheat:pla":
+			return [self.preheat_pla_gcode]
+		if payload == "filament:preheat:petg":
+			return [self.preheat_petg_gcode]
+		if payload == "filament:load":
+			return [self.load_filament_gcode]
+		if payload == "filament:unload":
+			return [self.unload_filament_gcode]
+		# Calibration
+		if payload == "calib:z":
+			return [self.calib_z_gcode]
+		if payload == "calib:bed_mesh":
+			return [self.calib_bed_mesh_gcode]
+		if payload == "calib:first_layer":
+			return [self.calib_first_layer_gcode]
+		if payload == "calib:probe":
+			return [self.calib_probe_gcode]
+		# MMU
+		if payload == "mmu:home":
+			return [self.mmu_home_gcode]
+		if payload == "mmu:resume":
+			return [self.mmu_resume_gcode]
+		if command == "mmu" and len(parts) == 3 and parts[1] == "locate":
+			return [self.mmu_locate_template.format(tool=int(parts[2]))]
+		# Printing
+		if payload == "print:pause":
+			return [self.print_pause_gcode]
+		if command == "flow" and len(parts) == 2:
+			return [self.flow_template.format(value=round(float(parts[1])))]
+		if command == "speed" and len(parts) == 2:
+			return [self.speed_template.format(value=round(float(parts[1])))]
+		# Macros
+		if payload == "fake:position":
+			return [self.fake_position_gcode]
 
 		raise ValueError(f"Unsupported payload: {payload}")
 
@@ -124,6 +202,14 @@ class ProtocolTranslator:
 		if state == "off":
 			return [self.light_off_gcode]
 		raise ValueError(f"Unsupported light state: {state}")
+
+	def _translate_home(self, axis: str) -> list[str]:
+		# Convert home:<axis> to G28 variant.
+		if axis == "all": return [self.home_all_gcode]
+		if axis == "x":   return [self.home_x_gcode]
+		if axis == "y":   return [self.home_y_gcode]
+		if axis == "z":   return [self.home_z_gcode]
+		raise ValueError(f"Unsupported home axis: {axis}")
 
 	def _translate_offset(self, raw_value: str) -> list[str]:
 		# Convert offset:<delta_mm> to the configured Z-offset Klipper macro.

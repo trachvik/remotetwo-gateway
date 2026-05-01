@@ -1,0 +1,22 @@
+[Unit]
+Description=RemoteTwo BLE Gateway
+Documentation=https://github.com/yourorg/remotetwo
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/RemoteTwo/remotetwo-gateway
+ExecStart=/home/pi/RemoteTwo/remotetwo-gateway/.venv/bin/python -m src.gateway \
+    --device-name remote_two \
+    --moonraker-url ws://localhost:7125/websocket \
+    --reconnect-delay 5
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=remotetwo-gateway
+
+[Install]
+WantedBy=multi-user.target
