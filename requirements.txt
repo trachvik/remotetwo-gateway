@@ -1,3 +1,2 @@
 bleak>=0.22.0
-pyserial>=3.5
 websockets>=12.0
