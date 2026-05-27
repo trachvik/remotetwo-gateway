@@ -80,19 +80,26 @@ def _make_rx_handler(
     translator: ProtocolTranslator,
     moonraker: MoonrakerClient,
 ):
-    # Return a Bleak notification callback that reassembles lines and dispatches commands.
-    buf = [""]
+    # Return a Bleak notification callback that reassembles incoming BLE packets
+    # into complete text lines and dispatches each line as a G-code command.
+    #
+    # The BLE ATT MTU is 20 bytes, so a single command like "cmd:1:home:all\n"
+    # arrives in one packet, but a longer command could arrive split across
+    # several packets. We accumulate bytes in 'buf' until we see '\n'.
+    buf = ""
 
     def _on_notify(_char, data: bytearray) -> None:
-        buf[0] += data.decode("utf-8", errors="ignore")
-        while "\n" in buf[0]:
-            line, buf[0] = buf[0].split("\n", 1)
+        nonlocal buf
+        # Append newly received bytes to the accumulation buffer.
+        buf += data.decode("utf-8", errors="ignore")
+        # Process every complete line (lines end with '\n').
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
             _handle_line(line.strip())
-        if buf[0]:
-            _handle_line(buf[0].strip())
-            buf[0] = ""
+        # Anything left in buf is a partial packet — wait for the next notification.
 
     def _handle_line(line: str) -> None:
+        # Translate one received command line into G-code and send it to Moonraker.
         if not line:
             return
         try:
@@ -100,9 +107,17 @@ def _make_rx_handler(
         except ValueError as exc:
             logging.warning("Dropping unsupported command '%s': %s", line, exc)
             return
+        # Strip the cmd:<id>: framing to get the raw payload for type detection.
+        payload = line.split(":", 2)[2] if line.startswith("cmd:") else line
+        # Movement (jog) commands skip the ACK wait so rapid knob turns feel
+        # instant — we just fire and forget.
+        is_jog = payload.startswith("mv:")
         for gcode in gcodes:
-            logging.info("RX cmd -> Moonraker: %s", gcode)
-            loop.create_task(moonraker.send_gcode(gcode))
+            logging.info("RX cmd -> Moonraker%s: %s", " [nowait]" if is_jog else "", gcode)
+            if is_jog:
+                loop.create_task(moonraker.send_gcode_nowait(gcode))
+            else:
+                loop.create_task(moonraker.send_gcode(gcode))
 
     return _on_notify
 
@@ -115,6 +130,8 @@ async def run(args: argparse.Namespace) -> int:
         light_off_gcode=args.light_off_gcode,
         sheet_template=args.sheet_template,
         z_offset_template=args.z_offset_template,
+        preheat_pla_gcode=args.preheat_pla_gcode,
+        preheat_petg_gcode=args.preheat_petg_gcode,
     )
 
     logging.info("Scanning for '%s' (timeout %ds) ...", args.device_name, args.scan_timeout)
@@ -131,10 +148,19 @@ async def run(args: argparse.Namespace) -> int:
     async with BleakClient(device, disconnected_callback=lambda _: disconnected.set()) as client:
         logging.info("Connected, GATT resolved")
 
+        # Serialized BLE sender — all outgoing state messages go through a single
+        # asyncio.Queue so their 20-byte chunks never interleave.
+        ble_tx_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def ble_sender() -> None:
+            while True:
+                msg = await ble_tx_queue.get()
+                await _ble_send_line(client, msg)
+
         def on_state_update(msgs: list[str]) -> None:
             for msg in msgs:
                 logging.debug("state -> BLE: %s", msg)
-                loop.create_task(_ble_send_line(client, msg))
+                ble_tx_queue.put_nowait(msg)
 
         moonraker = MoonrakerClient(url=args.moonraker_url, on_state=on_state_update)
 
@@ -144,6 +170,7 @@ async def run(args: argparse.Namespace) -> int:
         )
         logging.info("Subscribed to NUS TX notifications")
 
+        ble_sender_task = asyncio.create_task(ble_sender())
         moonraker_task = asyncio.create_task(moonraker.run())
         logging.info(
             "Gateway running — remote '%s' connected, Moonraker at %s",
@@ -152,6 +179,7 @@ async def run(args: argparse.Namespace) -> int:
 
         await disconnected.wait()
         logging.warning("BLE device disconnected")
+        ble_sender_task.cancel()
         moonraker_task.cancel()
 
     return 0
@@ -174,6 +202,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-timeout",    type=int, default=30, help="Seconds to scan for device before giving up")
     parser.add_argument("--light-on-gcode",  default=DEFAULT_LIGHT_ON,  help="G-code for l:on")
     parser.add_argument("--light-off-gcode", default=DEFAULT_LIGHT_OFF, help="G-code for l:off")
+    parser.add_argument(
+        "--preheat-pla-gcode",
+        default=DEFAULT_PREHEAT_PLA,
+        help="G-code for preheat PLA (default: M104 S210\\nM140 S60). Use PREHEAT_PLA for a Klipper macro.",
+    )
+    parser.add_argument(
+        "--preheat-petg-gcode",
+        default=DEFAULT_PREHEAT_PETG,
+        help="G-code for preheat PETG (default: M104 S230\\nM140 S80). Use PREHEAT_PETG for a Klipper macro.",
+    )
     parser.add_argument(
         "--sheet-template",
         default=DEFAULT_SHEET,

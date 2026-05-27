@@ -38,23 +38,26 @@ class MoonrakerClient:
         on_state: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._url = url
-        self._on_state = on_state
-        self._ws = None
-        self._next_id = 1
-        self._pending: dict[int, asyncio.Future] = {}
+        self._on_state = on_state        # callback to forward state strings to the BLE side
+        self._ws = None                  # active WebSocket connection (None when disconnected)
+        self._next_id = 1                # counter for JSON-RPC request IDs
+        self._pending: dict[int, asyncio.Future] = {}  # id -> Future waiting for ACK
         self._running = False
-        self._temp_cache: dict[str, float] = {}  # last known temperatures
-        self._fan_pct: float | None = None         # last known fan speed (0-100 %)
-        self._printing: bool = False               # currently printing
-        self._can_move: bool = True                # last computed can_move; default True so firmware is not blocked before first update
-        self._homed: str | None = None             # last known homed_axes string
+        # Cached printer state — kept between partial updates so we always have
+        # a complete picture to send to the remote control.
+        self._temp_cache: dict[str, float] = {}  # 'e' and 'b' temperatures
+        self._fan_pct: float | None = None        # fan speed 0–100 %
+        self._printing: bool = False              # True while a print job is running
+        self._can_move: bool = True               # allow movement (False while printing)
+        self._homed: str | None = None            # Klipper homed_axes string, e.g. 'xyz'
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        # Long-running coroutine — call with asyncio.create_task(). Reconnects on error.
+        # Main loop: connect to Moonraker, handle messages, reconnect on error.
+        # Call this with asyncio.create_task() — it runs until cancelled.
         self._running = True
         while self._running:
             try:
@@ -85,6 +88,23 @@ class MoonrakerClient:
             logger.warning("Moonraker G-code ack timed out: %s", script)
             self._pending.pop(req_id, None)
             return False
+
+    async def send_gcode_nowait(self, script: str) -> None:
+        # Fire-and-forget: send G-code to Moonraker without waiting for ACK.
+        # Use for rapid real-time commands (jogging) where latency matters more
+        # than delivery confirmation.
+        if self._ws is None:
+            logger.debug("Moonraker not connected, dropping nowait: %s", script)
+            return
+        try:
+            await self._ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "method":  "printer.gcode.script",
+                "params":  {"script": script},
+                "id":      self._alloc_id(),
+            }))
+        except Exception as exc:
+            logger.debug("Moonraker nowait send error: %s", exc)
 
     async def _session(self) -> None:
         import websockets  # lazy import so missing dep gives a clear error
@@ -120,26 +140,6 @@ class MoonrakerClient:
         }))
         logger.debug("Initial state query (id=%d)", req_id)
 
-    async def _send_gcode_coro(self, script: str) -> bool:
-        if self._ws is None:
-            return False
-        req_id = self._alloc_id()
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending[req_id] = fut
-        try:
-            await self._ws.send(json.dumps({
-                "jsonrpc": "2.0",
-                "method":  "printer.gcode.script",
-                "params":  {"script": script},
-                "id":      req_id,
-            }))
-            return await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("Moonraker G-code ack timed out: %s", script)
-            self._pending.pop(req_id, None)
-            return False
-
     async def _handle_message(self, raw: str) -> None:
         try:
             data = json.loads(raw)
@@ -169,7 +169,13 @@ class MoonrakerClient:
             self._process_status(status)
 
     def _process_status(self, status: dict) -> None:
-        # Convert Moonraker status dict to firmware state:… protocol strings.
+        # Called for every status update from Moonraker (both the initial full
+        # snapshot and incremental notifications). Converts the relevant fields
+        # into 'state:...' protocol strings and forwards them to the BLE side.
+        #
+        # Not every update contains every field — Moonraker only sends fields
+        # that changed. We use instance variables as a cache so we can always
+        # produce a complete state message from partial data.
         msgs: list[str] = []
 
         # Temperatures — merge into cache so partial updates don't lose previous values
@@ -214,12 +220,11 @@ class MoonrakerClient:
             logger.debug("homed_axes=%r", self._homed)
         if self._homed is not None:
             homed = self._homed
-            msgs.append(
-                f"state:homed"
-                f":x:{'1' if 'x' in homed else '0'}"
-                f":y:{'1' if 'y' in homed else '0'}"
-                f":z:{'1' if 'z' in homed else '0'}"
-            )
+            # Build per-axis flags: '1' if the axis appears in the homed string, else '0'.
+            x = '1' if 'x' in homed else '0'
+            y = '1' if 'y' in homed else '0'
+            z = '1' if 'z' in homed else '0'
+            msgs.append(f"state:homed:x:{x}:y:{y}:z:{z}")
 
         # Print state
         print_stats = status.get("print_stats", {})

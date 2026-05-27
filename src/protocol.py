@@ -38,8 +38,8 @@ class ProtocolTranslator:
 	# Temperature
 	cool_down_gcode: str = "TURN_OFF_HEATERS"
 	# Filament
-	preheat_pla_gcode: str = "PREHEAT_PLA"
-	preheat_petg_gcode: str = "PREHEAT_PETG"
+	preheat_pla_gcode: str = "M104 S210\nM140 S60"   # extruder + bed
+	preheat_petg_gcode: str = "M104 S230\nM140 S80"  # extruder + bed
 	load_filament_gcode: str = "LOAD_FILAMENT"
 	unload_filament_gcode: str = "UNLOAD_FILAMENT"
 	# Calibration
@@ -175,7 +175,9 @@ class ProtocolTranslator:
 		formatted_value = _format_number(value)
 		if axis == "e":
 			return ["M83", f"G1 E{formatted_value}"]
-		return ["G91", f"G1 {axis.upper()}{formatted_value}", "G90"]
+		# Combine into a single \n-separated script so Moonraker queues them
+		# atomically and gateway doesn't need to wait for 3 separate ACKs.
+		return [f"G91\nG1 {axis.upper()}{formatted_value}\nG90"]
 
 	@staticmethod
 	def _translate_temperature(target: str, raw_value: str) -> list[str]:
